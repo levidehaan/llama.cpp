@@ -1,4 +1,5 @@
 #include "llama-quant.h"
+#include "llama-prune.h"
 #include "llama-impl.h"
 #include "llama-model.h"
 #include "llama-model-loader.h"
@@ -635,6 +636,35 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         prune_list = *static_cast<const std::vector<int> *>(params->prune_layers);
     }
 
+    // Nash equilibrium attention head pruning
+    std::unique_ptr<llama_nash_result> nash_result;
+    if (params->nash_prune_params) {
+        const auto & nash_params = *static_cast<const llama_nash_prune_params *>(params->nash_prune_params);
+
+        LLAMA_LOG_INFO("\n");
+        LLAMA_LOG_INFO("=== Nash Equilibrium Attention Head Pruning ===\n");
+
+        // Compute pruning using imatrix data if available
+        std::vector<float> imatrix_flat;
+        if (imatrix_data) {
+            // Flatten imatrix data for importance computation
+            for (const auto & kv : *imatrix_data) {
+                for (float v : kv.second) {
+                    imatrix_flat.push_back(v);
+                }
+            }
+        }
+
+        nash_result = std::make_unique<llama_nash_result>(
+            llama_nash_compute_pruning(model, nash_params, imatrix_flat.empty() ? nullptr : &imatrix_flat)
+        );
+
+        LLAMA_LOG_INFO("Nash pruning: %d/%d heads removed (%.1f%% reduction)\n",
+                       nash_result->total_heads_pruned,
+                       nash_result->total_heads_original,
+                       nash_result->prune_ratio * 100.0f);
+    }
+
     // copy the KV pairs from the input file
     gguf_set_kv     (ctx_out.get(), ml.meta.get());
     gguf_set_val_u32(ctx_out.get(), "general.quantization_version", GGML_QNT_VERSION); // TODO: use LLM_KV
@@ -685,6 +715,26 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     }
     if (!prune_list.empty()) {
         gguf_set_val_u32(ctx_out.get(), ml.llm_kv(LLM_KV_BLOCK_COUNT).c_str(), blk_id);
+    }
+
+    // Update GGUF metadata for Nash pruning
+    if (nash_result && nash_result->total_heads_pruned > 0) {
+        // Set per-layer head counts as arrays
+        std::vector<uint32_t> n_head_arr(nash_result->n_head_new.begin(), nash_result->n_head_new.end());
+        std::vector<uint32_t> n_head_kv_arr(nash_result->n_head_kv_new.begin(), nash_result->n_head_kv_new.end());
+
+        // Update head count metadata with pruned values
+        gguf_set_arr_data(ctx_out.get(), ml.llm_kv(LLM_KV_ATTENTION_HEAD_COUNT).c_str(),
+                          GGUF_TYPE_UINT32, n_head_arr.data(), n_head_arr.size());
+        gguf_set_arr_data(ctx_out.get(), ml.llm_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV).c_str(),
+                          GGUF_TYPE_UINT32, n_head_kv_arr.data(), n_head_kv_arr.size());
+
+        // Add pruning metadata
+        gguf_set_val_str(ctx_out.get(), "llama.pruning.method", "nash_equilibrium");
+        gguf_set_val_u32(ctx_out.get(), "llama.pruning.total_heads_pruned", nash_result->total_heads_pruned);
+        gguf_set_val_f32(ctx_out.get(), "llama.pruning.prune_ratio", nash_result->prune_ratio);
+
+        LLAMA_LOG_INFO("Updated GGUF metadata with per-layer head counts\n");
     }
 
     // keep_split requires that the weights are sorted by split index
@@ -1051,7 +1101,8 @@ llama_model_quantize_params llama_model_quantize_default_params() {
         /*.imatrix                     =*/ nullptr,
         /*.kv_overrides                =*/ nullptr,
         /*.tensor_type                 =*/ nullptr,
-        /*.prune_layers                =*/ nullptr
+        /*.prune_layers                =*/ nullptr,
+        /*.nash_prune_params           =*/ nullptr
     };
 
     return result;
