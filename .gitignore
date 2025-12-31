@@ -137,3 +137,8 @@ poetry.toml
 /.windsurf/
 # emscripten
 a.out.*
+
+# Nash pruning test artifacts
+calibration.txt
+imatrix.dat
+*.imatrix
