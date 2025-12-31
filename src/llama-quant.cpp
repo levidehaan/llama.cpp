@@ -729,6 +729,14 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         gguf_set_arr_data(ctx_out.get(), ml.llm_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV).c_str(),
                           GGUF_TYPE_UINT32, n_head_kv_arr.data(), n_head_kv_arr.size());
 
+        // CRITICAL: Set key/value lengths to original head dimensions
+        // Without this, the loader computes n_embd_head_k = n_embd / n_head which is wrong
+        // for pruned models where n_head is reduced but head dimension stays the same
+        gguf_set_val_u32(ctx_out.get(), ml.llm_kv(LLM_KV_ATTENTION_KEY_LENGTH).c_str(),
+                         model.hparams.n_embd_head_k);
+        gguf_set_val_u32(ctx_out.get(), ml.llm_kv(LLM_KV_ATTENTION_VALUE_LENGTH).c_str(),
+                         model.hparams.n_embd_head_v);
+
         // Add pruning metadata
         gguf_set_val_str(ctx_out.get(), "llama.pruning.method", "nash_equilibrium");
         gguf_set_val_u32(ctx_out.get(), "llama.pruning.total_heads_pruned", nash_result->total_heads_pruned);
@@ -788,12 +796,45 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
     ctx_outs[0] = std::move(ctx_out);
 
     // populate the original tensors so we get an initial meta data
+    // If Nash pruning is enabled, modify tensor dimensions for pruned attention tensors
     for (const auto * it : tensors) {
         uint16_t i_split = params->keep_split ? it->idx : 0;
         ggml_tensor * tensor = it->tensor;
         if (!ctx_outs[i_split]) {
             ctx_outs[i_split].reset(gguf_init_empty());
         }
+
+        // Check if this tensor needs dimension modification for Nash pruning
+        if (nash_result && nash_result->total_heads_pruned > 0) {
+            const std::string tname = ggml_get_name(tensor);
+            int64_t orig_ne[4] = {tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]};
+            int64_t new_ne[4];
+
+            if (llama_nash_get_pruned_dims(*nash_result, tname, orig_ne, new_ne,
+                                           (int)model.hparams.n_embd,
+                                           (int)model.hparams.n_embd_head_k)) {
+                // Temporarily modify tensor dimensions
+                tensor->ne[0] = new_ne[0];
+                tensor->ne[1] = new_ne[1];
+                tensor->ne[2] = new_ne[2];
+                tensor->ne[3] = new_ne[3];
+
+                LLAMA_LOG_DEBUG("Nash: modifying tensor %s dims [%lld,%lld,%lld,%lld] -> [%lld,%lld,%lld,%lld]\n",
+                               tname.c_str(),
+                               (long long)orig_ne[0], (long long)orig_ne[1], (long long)orig_ne[2], (long long)orig_ne[3],
+                               (long long)new_ne[0], (long long)new_ne[1], (long long)new_ne[2], (long long)new_ne[3]);
+
+                gguf_add_tensor(ctx_outs[i_split].get(), tensor);
+
+                // Restore original dimensions (needed for reading data)
+                tensor->ne[0] = orig_ne[0];
+                tensor->ne[1] = orig_ne[1];
+                tensor->ne[2] = orig_ne[2];
+                tensor->ne[3] = orig_ne[3];
+                continue;
+            }
+        }
+
         gguf_add_tensor(ctx_outs[i_split].get(), tensor);
     }
 
@@ -808,6 +849,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
 
     int cur_split = -1;
     std::ofstream fout;
+
+    // Buffer for sliced tensor data (Nash pruning)
+    std::vector<float> sliced_data_buf;
     auto close_ofstream = [&]() {
         // Write metadata and close file handler
         if (fout.is_open()) {
@@ -951,13 +995,52 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
             // If we've decided to quantize to the same type the tensor is already
             // in then there's nothing to do.
             quantize = tensor->type != new_type;
+
+            // Nash pruning: force requantize for attention tensors that need slicing
+            if (!quantize && nash_result && nash_result->total_heads_pruned > 0) {
+                int64_t orig_ne[4] = {tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]};
+                int64_t new_ne[4];
+                if (llama_nash_get_pruned_dims(*nash_result, name, orig_ne, new_ne,
+                                               (int)model.hparams.n_embd,
+                                               (int)model.hparams.n_embd_head_k)) {
+                    // This tensor needs slicing, so force requantization
+                    quantize = true;
+                    LLAMA_LOG_INFO("Nash: forcing requantize for slicing .. ");
+                }
+            }
         }
 
         if (!quantize) {
             new_type = tensor->type;
             new_data = tensor->data;
             new_size = ggml_nbytes(tensor);
-            LLAMA_LOG_INFO("size = %8.3f MiB\n", ggml_nbytes(tensor)/1024.0/1024.0);
+
+            // Nash pruning: slice non-quantized tensors (e.g., biases)
+            if (nash_result && nash_result->total_heads_pruned > 0) {
+                int64_t orig_ne[4] = {tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]};
+                int64_t new_ne[4];
+                if (llama_nash_get_pruned_dims(*nash_result, name, orig_ne, new_ne,
+                                               (int)model.hparams.n_embd,
+                                               (int)model.hparams.n_embd_head_k)) {
+                    // Slice the data for non-quantized tensors
+                    size_t new_nelements = new_ne[0] * new_ne[1] * new_ne[2] * new_ne[3];
+                    size_t type_size = ggml_type_size(tensor->type);
+                    if (sliced_data_buf.size() < new_nelements) {
+                        sliced_data_buf.resize(new_nelements);
+                    }
+
+                    new_size = llama_nash_slice_data(*nash_result, name,
+                                                     tensor->data, sliced_data_buf.data(),
+                                                     orig_ne, type_size,
+                                                     (int)model.hparams.n_embd,
+                                                     (int)model.hparams.n_embd_head_k);
+                    new_data = sliced_data_buf.data();
+                    LLAMA_LOG_INFO("Nash: sliced %s from [%" PRId64 "] to [%" PRId64 "] .. ",
+                                   name.c_str(), orig_ne[0], new_ne[0]);
+                }
+            }
+
+            LLAMA_LOG_INFO("size = %8.3f MiB\n", new_size/1024.0/1024.0);
         } else {
             const int64_t nelements = ggml_nelements(tensor);
 
@@ -1008,27 +1091,60 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
                 f32_data = (float *) f32_conv_buf.data();
             }
 
+            // Nash pruning: slice attention tensor data if needed
+            int64_t quant_ne[4] = {tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3]};
+            if (nash_result && nash_result->total_heads_pruned > 0) {
+                int64_t new_ne[4];
+                if (llama_nash_get_pruned_dims(*nash_result, name, quant_ne, new_ne,
+                                               (int)model.hparams.n_embd,
+                                               (int)model.hparams.n_embd_head_k)) {
+                    // Slice the f32 data
+                    size_t new_nelements = new_ne[0] * new_ne[1] * new_ne[2] * new_ne[3];
+                    if (sliced_data_buf.size() < new_nelements) {
+                        sliced_data_buf.resize(new_nelements);
+                    }
+
+                    size_t sliced_size = llama_nash_slice_data(*nash_result, name,
+                                                               f32_data, sliced_data_buf.data(),
+                                                               quant_ne, sizeof(float),
+                                                               (int)model.hparams.n_embd,
+                                                               (int)model.hparams.n_embd_head_k);
+
+                    LLAMA_LOG_INFO("Nash: sliced %s from [%" PRId64 ",%" PRId64 "] to [%" PRId64 ",%" PRId64 "] (%.2f KB -> %.2f KB) .. ",
+                                   name.c_str(), quant_ne[0], quant_ne[1], new_ne[0], new_ne[1],
+                                   (float)(quant_ne[0] * quant_ne[1] * sizeof(float)) / 1024.0f,
+                                   (float)sliced_size / 1024.0f);
+
+                    f32_data = sliced_data_buf.data();
+                    quant_ne[0] = new_ne[0];
+                    quant_ne[1] = new_ne[1];
+                    quant_ne[2] = new_ne[2];
+                    quant_ne[3] = new_ne[3];
+                }
+            }
+
             LLAMA_LOG_INFO("converting to %s .. ", ggml_type_name(new_type));
             fflush(stdout);
 
-            if (work.size() < (size_t)nelements * 4) {
-                work.resize(nelements * 4); // upper bound on size
+            const int64_t sliced_nelements = quant_ne[0] * quant_ne[1] * quant_ne[2] * quant_ne[3];
+            if (work.size() < (size_t)sliced_nelements * 4) {
+                work.resize(sliced_nelements * 4); // upper bound on size
             }
             new_data = work.data();
 
-            const int64_t n_per_row = tensor->ne[0];
-            const int64_t nrows = tensor->ne[1];
+            const int64_t n_per_row = quant_ne[0];
+            const int64_t nrows = quant_ne[1];
 
             static const int64_t min_chunk_size = 32 * 512;
             const int64_t chunk_size = (n_per_row >= min_chunk_size ? n_per_row : n_per_row * ((min_chunk_size + n_per_row - 1)/n_per_row));
 
-            const int64_t nelements_matrix = tensor->ne[0] * tensor->ne[1];
+            const int64_t nelements_matrix = quant_ne[0] * quant_ne[1];
             const int64_t nchunk = (nelements_matrix + chunk_size - 1)/chunk_size;
             const int64_t nthread_use = nthread > 1 ? std::max((int64_t)1, std::min((int64_t)nthread, nchunk)) : 1;
 
             // quantize each expert separately since they have different importance matrices
             new_size = 0;
-            for (int64_t i03 = 0; i03 < tensor->ne[2]; ++i03) {
+            for (int64_t i03 = 0; i03 < quant_ne[2]; ++i03) {
                 const float * f32_data_03 = f32_data + i03 * nelements_matrix;
                 void * new_data_03 = (char *)new_data + ggml_row_size(new_type, n_per_row) * i03 * nrows;
                 const float * imatrix_03 = imatrix ? imatrix + i03 * n_per_row : nullptr;

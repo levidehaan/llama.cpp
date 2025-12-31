@@ -334,10 +334,13 @@ static llama_nash_result apply_pruning(llama_nash_state & state) {
         result.total_heads_pruned += n_pruned;
         result.n_head_new[il] = nh - n_pruned;
 
-        // Adjust KV heads proportionally for GQA
+        // Adjust KV heads to maintain GQA ratio
+        // This is required because attention kernels expect n_head % n_head_kv == 0
         if (nh_kv > 0 && nh > nh_kv && n_pruned > 0) {
             int gqa_ratio = nh / nh_kv;
-            result.n_head_kv_new[il] = result.n_head_new[il] / gqa_ratio;
+            int new_kv = (nh - n_pruned) / gqa_ratio;
+            if (new_kv < 1) new_kv = 1;  // Keep at least 1 KV head
+            result.n_head_kv_new[il] = new_kv;
         } else {
             result.n_head_kv_new[il] = nh_kv;
         }
@@ -625,4 +628,233 @@ bool llama_nash_save_stats(const llama_nash_result & result, const std::string &
 
     LLAMA_LOG_INFO("%s: saved stats to %s\n", __func__, path.c_str());
     return true;
+}
+
+bool llama_nash_get_pruned_dims(
+    const llama_nash_result & result,
+    const std::string       & name,
+    int64_t                   ne[4],
+    int64_t                   new_ne[4],
+    int                       n_embd,
+    int                       n_embd_head_k
+) {
+    (void)n_embd;  // May be used in future
+
+    // Copy original dimensions
+    for (int i = 0; i < 4; i++) {
+        new_ne[i] = ne[i];
+    }
+
+    int layer = llama_nash_get_layer_from_name(name);
+    if (layer < 0 || layer >= (int)result.head_mask.size()) {
+        return false;
+    }
+
+    const auto & mask = result.head_mask[layer];
+    int n_heads_orig = (int)mask.size();
+    int n_heads_new = result.n_heads_kept(layer);
+
+    if (n_heads_new == n_heads_orig || n_heads_new == 0) {
+        return false;  // No pruning for this layer
+    }
+
+    bool is_q      = name.find("attn_q") != std::string::npos && name.find("attn_output") == std::string::npos;
+    bool is_k      = name.find("attn_k") != std::string::npos;
+    bool is_v      = name.find("attn_v") != std::string::npos;
+    bool is_output = name.find("attn_output") != std::string::npos;
+    bool is_bias   = name.find(".bias") != std::string::npos;
+
+    // Get KV head reduction for this layer
+    int n_heads_kv_new = (int)result.n_head_kv_new[layer];
+    int n_heads_kv_orig = (int)(result.n_head_new[layer] > 0 ?
+                                (n_heads_orig * result.n_head_kv_new[layer]) / result.n_head_new[layer] :
+                                result.n_head_kv_new[layer]);
+    // Approximate original KV heads from the GQA ratio
+    int gqa_ratio = (result.n_head_new[layer] > 0 && result.n_head_kv_new[layer] > 0) ?
+                    result.n_head_new[layer] / result.n_head_kv_new[layer] : 1;
+    if (gqa_ratio < 1) gqa_ratio = 1;
+    n_heads_kv_orig = n_heads_orig / gqa_ratio;
+    if (n_heads_kv_orig < 1) n_heads_kv_orig = 1;
+
+    if (!is_q && !is_k && !is_v && !is_output) {
+        return false;
+    }
+
+    int64_t head_dim = n_embd_head_k;
+
+    if (is_bias) {
+        if (is_q) {
+            // Q bias: 1D tensor [head_dim * n_heads] -> [head_dim * n_heads_new]
+            new_ne[0] = head_dim * n_heads_new;
+        } else if (is_k || is_v) {
+            // K/V bias: [head_dim * n_heads_kv] -> [head_dim * n_heads_kv_new]
+            if (n_heads_kv_new != n_heads_kv_orig) {
+                new_ne[0] = head_dim * n_heads_kv_new;
+            } else {
+                return false;
+            }
+        }
+    } else if (is_q) {
+        // wq: [n_embd, head_dim * n_heads] -> [n_embd, head_dim * n_heads_new]
+        new_ne[1] = head_dim * n_heads_new;
+    } else if (is_k || is_v) {
+        // wk/wv: [n_embd, head_dim * n_heads_kv] -> [n_embd, head_dim * n_heads_kv_new]
+        if (n_heads_kv_new != n_heads_kv_orig) {
+            new_ne[1] = head_dim * n_heads_kv_new;
+        } else {
+            return false;
+        }
+    } else if (is_output) {
+        // wo: [head_dim * n_heads, n_embd] -> [head_dim * n_heads_new, n_embd]
+        new_ne[0] = head_dim * n_heads_new;
+    }
+
+    return true;
+}
+
+size_t llama_nash_slice_data(
+    const llama_nash_result & result,
+    const std::string       & name,
+    const void              * data_in,
+    void                    * data_out,
+    int64_t                   ne[4],
+    size_t                    type_size,
+    int                       n_embd,
+    int                       n_embd_head_k
+) {
+    int layer = llama_nash_get_layer_from_name(name);
+    if (layer < 0 || layer >= (int)result.head_mask.size()) {
+        // Just copy the data unchanged
+        size_t total_size = ne[0] * ne[1] * ne[2] * ne[3] * type_size;
+        memcpy(data_out, data_in, total_size);
+        return total_size;
+    }
+
+    const auto & mask = result.head_mask[layer];
+    int n_heads_orig = (int)mask.size();
+    int n_heads_new = result.n_heads_kept(layer);
+
+    if (n_heads_new == n_heads_orig || n_heads_new == 0) {
+        size_t total_size = ne[0] * ne[1] * ne[2] * ne[3] * type_size;
+        memcpy(data_out, data_in, total_size);
+        return total_size;
+    }
+
+    bool is_q      = name.find("attn_q") != std::string::npos && name.find("attn_output") == std::string::npos;
+    bool is_k      = name.find("attn_k") != std::string::npos;
+    bool is_v      = name.find("attn_v") != std::string::npos;
+    bool is_output = name.find("attn_output") != std::string::npos;
+    bool is_bias   = name.find(".bias") != std::string::npos;
+
+    // Calculate KV head counts
+    int gqa_ratio = (result.n_head_new[layer] > 0 && result.n_head_kv_new[layer] > 0) ?
+                    result.n_head_new[layer] / result.n_head_kv_new[layer] : 1;
+    if (gqa_ratio < 1) gqa_ratio = 1;
+    int n_heads_kv_orig = n_heads_orig / gqa_ratio;
+    if (n_heads_kv_orig < 1) n_heads_kv_orig = 1;
+    int n_heads_kv_new = (int)result.n_head_kv_new[layer];
+
+    if (!is_q && !is_k && !is_v && !is_output) {
+        size_t total_size = ne[0] * ne[1] * ne[2] * ne[3] * type_size;
+        memcpy(data_out, data_in, total_size);
+        return total_size;
+    }
+
+    // Check if KV tensors actually need slicing
+    if ((is_k || is_v) && n_heads_kv_new == n_heads_kv_orig) {
+        size_t total_size = ne[0] * ne[1] * ne[2] * ne[3] * type_size;
+        memcpy(data_out, data_in, total_size);
+        return total_size;
+    }
+
+    int64_t head_dim = n_embd_head_k;
+    const char * src = (const char *)data_in;
+    char * dst = (char *)data_out;
+
+    LLAMA_LOG_DEBUG("%s: slicing %s layer %d: %d -> %d heads\n",
+                    __func__, name.c_str(), layer, n_heads_orig, n_heads_new);
+
+    if (is_bias) {
+        if (is_q) {
+            // Q Bias: 1D [head_dim * n_heads]
+            size_t head_bytes = head_dim * type_size;
+            size_t dst_offset = 0;
+
+            for (int h = 0; h < n_heads_orig; h++) {
+                if (!mask[h]) {
+                    memcpy(dst + dst_offset, src + h * head_bytes, head_bytes);
+                    dst_offset += head_bytes;
+                }
+            }
+            return dst_offset;
+        } else if (is_k || is_v) {
+            // K/V Bias: Keep first n_heads_kv_new heads
+            size_t copy_size = head_dim * n_heads_kv_new * type_size;
+            memcpy(dst, src, copy_size);
+            return copy_size;
+        }
+    } else if (is_k || is_v) {
+        // wk/wv: [n_embd, head_dim * n_heads_kv] - keep first n_heads_kv_new heads
+        int64_t n_rows = ne[0];
+        size_t old_cols = ne[1];
+        size_t new_cols = head_dim * n_heads_kv_new;
+
+        // For each row, copy only the columns for kept heads
+        for (int64_t row = 0; row < n_rows; row++) {
+            memcpy(dst + row * new_cols * type_size,
+                   src + row * old_cols * type_size,
+                   new_cols * type_size);
+        }
+        return n_rows * new_cols * type_size;
+    } else if (is_q) {
+        // wq: [n_embd, head_dim * n_heads] - columns are heads
+        // ne[0] = n_embd (rows), ne[1] = head_dim * n_heads (cols)
+        int64_t n_rows = ne[0];
+        size_t row_bytes = type_size;  // Per element
+        size_t new_cols = head_dim * n_heads_new;
+
+        for (int64_t row = 0; row < n_rows; row++) {
+            size_t dst_col = 0;
+            for (int h = 0; h < n_heads_orig; h++) {
+                if (!mask[h]) {
+                    for (int64_t d = 0; d < head_dim; d++) {
+                        int64_t src_col = h * head_dim + d;
+                        memcpy(dst + (row * new_cols + dst_col) * row_bytes,
+                               src + (row * ne[1] + src_col) * row_bytes,
+                               row_bytes);
+                        dst_col++;
+                    }
+                }
+            }
+        }
+        return n_rows * new_cols * type_size;
+
+    } else if (is_output) {
+        // wo: [head_dim * n_heads, n_embd] - rows are heads
+        // ne[0] = head_dim * n_heads (rows), ne[1] = n_embd (cols)
+        int64_t n_cols = ne[1];
+        size_t elem_bytes = type_size;
+        int64_t new_rows = head_dim * n_heads_new;
+
+        for (int64_t col = 0; col < n_cols; col++) {
+            size_t dst_row = 0;
+            for (int h = 0; h < n_heads_orig; h++) {
+                if (!mask[h]) {
+                    for (int64_t d = 0; d < head_dim; d++) {
+                        int64_t src_row = h * head_dim + d;
+                        memcpy(dst + (col * new_rows + dst_row) * elem_bytes,
+                               src + (col * ne[0] + src_row) * elem_bytes,
+                               elem_bytes);
+                        dst_row++;
+                    }
+                }
+            }
+        }
+        return new_rows * n_cols * type_size;
+    }
+
+    // Fallback: copy unchanged
+    size_t total_size = ne[0] * ne[1] * ne[2] * ne[3] * type_size;
+    memcpy(data_out, data_in, total_size);
+    return total_size;
 }

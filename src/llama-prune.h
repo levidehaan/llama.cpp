@@ -118,6 +118,31 @@ ggml_tensor * llama_nash_slice_tensor(
 // Returns -1 if not a layer tensor
 int llama_nash_get_layer_from_name(const std::string & name);
 
+// Calculate new dimensions for a pruned tensor
+// Returns true if tensor should be sliced, false otherwise
+// Updates new_ne with the new dimensions
+bool llama_nash_get_pruned_dims(
+    const llama_nash_result & result,
+    const std::string       & name,
+    int64_t                   ne[4],      // Original dimensions
+    int64_t                   new_ne[4],  // Output: new dimensions
+    int                       n_embd,
+    int                       n_embd_head_k
+);
+
+// Slice tensor data in-place, returns the new size in bytes
+// data_out must be pre-allocated with sufficient size
+size_t llama_nash_slice_data(
+    const llama_nash_result & result,
+    const std::string       & name,
+    const void              * data_in,
+    void                    * data_out,
+    int64_t                   ne[4],
+    size_t                    type_size,
+    int                       n_embd,
+    int                       n_embd_head_k
+);
+
 // Print pruning statistics to log
 void llama_nash_print_stats(const llama_nash_result & result);
 
