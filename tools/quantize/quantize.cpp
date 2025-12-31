@@ -1,5 +1,6 @@
 #include "common.h"
 #include "llama.h"
+#include "../../src/llama-prune.h"
 #include "gguf.h"
 
 #include <cstdio>
@@ -119,6 +120,7 @@ static bool try_parse_ftype(const std::string & ftype_str_in, llama_ftype & ftyp
 static void usage(const char * executable) {
     printf("usage: %s [--help] [--allow-requantize] [--leave-output-tensor] [--pure] [--imatrix] [--include-weights]\n", executable);
     printf("       [--exclude-weights] [--output-tensor-type] [--token-embedding-type] [--tensor-type] [--prune-layers] [--keep-split] [--override-kv]\n");
+    printf("       [--nash-prune] [--nash-lambda] [--nash-threshold] [--nash-verbose]\n");
     printf("       model-f32.gguf [model-quant.gguf] type [nthreads]\n\n");
     printf("  --allow-requantize: Allows requantizing tensors that have already been quantized. Warning: This can severely reduce quality compared to quantizing from 16bit or 32bit\n");
     printf("  --leave-output-tensor: Will leave output.weight un(re)quantized. Increases model size but may also increase quality, especially when requantizing\n");
@@ -135,7 +137,14 @@ static void usage(const char * executable) {
     printf("  --keep-split: will generate quantized model in the same shards as input\n");
     printf("  --override-kv KEY=TYPE:VALUE\n");
     printf("      Advanced option to override model metadata by key in the quantized model. May be specified multiple times.\n");
-    printf("Note: --include-weights and --exclude-weights cannot be used together\n");
+    printf("\nNash Equilibrium Attention Head Pruning (experimental):\n");
+    printf("  --nash-prune: Enable Nash equilibrium-based attention head pruning\n");
+    printf("  --nash-lambda FLOAT: Redundancy penalty weight (default: 0.5)\n");
+    printf("  --nash-threshold FLOAT: Pruning threshold for s_i values (default: 0.1)\n");
+    printf("  --nash-max-prune FLOAT: Maximum pruning ratio per layer (default: 0.7)\n");
+    printf("  --nash-min-heads INT: Minimum heads to keep per layer (default: 1)\n");
+    printf("  --nash-verbose: Print per-head pruning statistics\n");
+    printf("\nNote: --include-weights and --exclude-weights cannot be used together\n");
     printf("\nAllowed quantization types:\n");
     for (const auto & it : QUANT_OPTIONS) {
         if (it.name != "COPY") {
@@ -454,6 +463,10 @@ int main(int argc, char ** argv) {
     std::vector<tensor_quantization> tensor_types;
     std::vector<int> prune_layers;
 
+    // Nash equilibrium pruning parameters
+    bool enable_nash_prune = false;
+    llama_nash_prune_params nash_params;
+
     for (; arg_idx < argc && strncmp(argv[arg_idx], "--", 2) == 0; arg_idx++) {
         if (strcmp(argv[arg_idx], "--leave-output-tensor") == 0) {
             params.quantize_output_tensor = false;
@@ -511,6 +524,34 @@ int main(int argc, char ** argv) {
             }
         } else if (strcmp(argv[arg_idx], "--keep-split") == 0) {
             params.keep_split = true;
+        } else if (strcmp(argv[arg_idx], "--nash-prune") == 0) {
+            enable_nash_prune = true;
+        } else if (strcmp(argv[arg_idx], "--nash-lambda") == 0) {
+            if (arg_idx < argc-1) {
+                nash_params.lambda = std::stof(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nash-threshold") == 0) {
+            if (arg_idx < argc-1) {
+                nash_params.prune_threshold = std::stof(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nash-max-prune") == 0) {
+            if (arg_idx < argc-1) {
+                nash_params.max_prune_ratio = std::stof(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nash-min-heads") == 0) {
+            if (arg_idx < argc-1) {
+                nash_params.min_heads_per_layer = std::stoi(argv[++arg_idx]);
+            } else {
+                usage(argv[0]);
+            }
+        } else if (strcmp(argv[arg_idx], "--nash-verbose") == 0) {
+            nash_params.verbose = true;
         } else {
             usage(argv[0]);
         }
@@ -573,6 +614,14 @@ int main(int argc, char ** argv) {
     }
     if (!prune_layers.empty()) {
         params.prune_layers = &prune_layers;
+    }
+    if (enable_nash_prune) {
+        params.nash_prune_params = &nash_params;
+        printf("Nash equilibrium pruning enabled:\n");
+        printf("  lambda: %.3f\n", nash_params.lambda);
+        printf("  threshold: %.3f\n", nash_params.prune_threshold);
+        printf("  max_prune_ratio: %.3f\n", nash_params.max_prune_ratio);
+        printf("  min_heads_per_layer: %d\n", nash_params.min_heads_per_layer);
     }
 
     llama_backend_init();

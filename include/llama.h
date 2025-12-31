@@ -381,6 +381,7 @@ extern "C" {
         void * kv_overrides;                  // pointer to vector containing overrides
         void * tensor_types;                  // pointer to vector containing tensor types
         void * prune_layers;                  // pointer to vector containing layer indices to prune
+        void * nash_prune_params;             // pointer to llama_nash_prune_params for attention head pruning
     } llama_model_quantize_params;
 
     typedef struct llama_logit_bias {
