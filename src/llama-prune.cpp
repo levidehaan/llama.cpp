@@ -537,6 +537,8 @@ ggml_tensor * llama_nash_slice_tensor(
     int                         n_embd,
     int                         n_embd_head_k
 ) {
+    (void)n_embd;  // May be used in future for validation
+
     int layer = llama_nash_get_layer_from_name(name);
     if (layer < 0 || layer >= (int)result.head_mask.size()) {
         return tensor;  // Not a layer tensor, return unchanged
@@ -808,6 +810,8 @@ size_t llama_nash_slice_data(
     int                       n_embd,
     int                       n_embd_head_k
 ) {
+    (void)n_embd;  // May be used in future for validation
+
     int layer = llama_nash_get_layer_from_name(name);
     if (layer < 0 || layer >= (int)result.head_mask.size()) {
         // Just copy the data unchanged
