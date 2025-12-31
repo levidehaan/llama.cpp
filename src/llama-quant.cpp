@@ -644,19 +644,9 @@ static void llama_model_quantize_impl(const std::string & fname_inp, const std::
         LLAMA_LOG_INFO("\n");
         LLAMA_LOG_INFO("=== Nash Equilibrium Attention Head Pruning ===\n");
 
-        // Compute pruning using imatrix data if available
-        std::vector<float> imatrix_flat;
-        if (imatrix_data) {
-            // Flatten imatrix data for importance computation
-            for (const auto & kv : *imatrix_data) {
-                for (float v : kv.second) {
-                    imatrix_flat.push_back(v);
-                }
-            }
-        }
-
+        // Pass imatrix data directly for per-tensor importance computation
         nash_result = std::make_unique<llama_nash_result>(
-            llama_nash_compute_pruning(model, nash_params, imatrix_flat.empty() ? nullptr : &imatrix_flat)
+            llama_nash_compute_pruning(model, nash_params, imatrix_data)
         );
 
         LLAMA_LOG_INFO("Nash pruning: %d/%d heads removed (%.1f%% reduction)\n",

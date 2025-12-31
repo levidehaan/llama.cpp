@@ -26,6 +26,7 @@ struct llama_nash_state {
     std::vector<int> n_head_kv;   // Original KV head counts per layer
     int n_embd;
     int n_embd_head_k;
+    int head_dim;  // Dimension per head (same as n_embd_head_k)
 
     // Per-head data [layer][head]
     std::vector<std::vector<float>> importance;     // c_i: contribution scores
@@ -44,6 +45,7 @@ struct llama_nash_state {
         n_layer       = (int)hparams.n_layer;
         n_embd        = (int)hparams.n_embd;
         n_embd_head_k = (int)hparams.n_embd_head_k;
+        head_dim      = n_embd_head_k;  // Alias for convenience
 
         // Initialize per-layer head counts
         n_head.resize(n_layer);
@@ -76,61 +78,130 @@ struct llama_nash_state {
 // Importance computation
 //
 
+
 // Compute head importance from imatrix data
-// The imatrix contains importance values for each weight element
-// We aggregate these for each attention head
-static void compute_importance_from_imatrix(
-    llama_nash_state         & state,
-    const std::vector<float> & imatrix_data
+// The imatrix stores per-row importance (one value per input dimension)
+// For attention output weights (wo) with shape [head_dim * n_heads, n_embd]:
+//   - imatrix has (head_dim * n_heads) values
+//   - Each head corresponds to head_dim consecutive input dimensions
+//   - Head importance = sum of importance for that head's dimensions
+static bool compute_importance_from_imatrix(
+    llama_nash_state          & state,
+    const llama_imatrix_data  & imatrix
 ) {
-    // For now, use uniform importance if imatrix is not properly formatted
-    // In a full implementation, we'd parse the imatrix structure to find
-    // per-head importance from wq tensor importance values
+    LLAMA_LOG_INFO("%s: computing head importance from imatrix data\n", __func__);
 
-    LLAMA_LOG_INFO("%s: computing head importance from imatrix (%zu values)\n",
-                   __func__, imatrix_data.size());
+    int layers_found = 0;
 
-    // Simple heuristic: use variance in importance as a proxy
-    // Heads with more variance in their weights are more specialized
     for (int il = 0; il < state.n_layer; il++) {
-        for (int h = 0; h < state.n_head[il]; h++) {
-            // Initialize with slight random variation for testing
-            // This will be replaced with actual imatrix parsing
-            state.importance[il][h] = 1.0f + 0.1f * ((float)(h % 7) - 3.0f) / 3.0f;
-        }
+        int n_head = state.n_head[il];
+        int head_dim = state.head_dim;
 
-        // Normalize within layer
-        float sum = 0.0f;
-        for (int h = 0; h < state.n_head[il]; h++) {
-            sum += state.importance[il][h];
-        }
-        if (sum > 0.0f) {
-            for (int h = 0; h < state.n_head[il]; h++) {
-                state.importance[il][h] /= sum;
-                state.importance[il][h] *= state.n_head[il]; // Scale to ~1.0 average
+        // Look for attention output weight tensor importance for this layer
+        // wo has shape [head_dim * n_heads, n_embd], so imatrix has (head_dim * n_heads) values
+        // These map directly to head dimensions!
+        std::vector<std::string> wo_names = {
+            "blk." + std::to_string(il) + ".attn_output.weight",
+            "blk." + std::to_string(il) + ".attn_o_proj.weight",
+            "model.layers." + std::to_string(il) + ".self_attn.o_proj.weight"
+        };
+
+        const std::vector<float> * wo_importance = nullptr;
+        std::string found_name;
+
+        for (const auto & name : wo_names) {
+            auto it = imatrix.find(name);
+            if (it != imatrix.end()) {
+                wo_importance = &it->second;
+                found_name = name;
+                break;
             }
         }
+
+        if (!wo_importance) {
+            // Try pattern matching for attention output weight
+            for (const auto & [name, values] : imatrix) {
+                if (name.find("attn_output") != std::string::npos &&
+                    name.find(".weight") != std::string::npos) {
+                    std::string layer_str = "blk." + std::to_string(il) + ".";
+                    if (name.find(layer_str) != std::string::npos) {
+                        wo_importance = &values;
+                        found_name = name;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (!wo_importance || wo_importance->empty()) {
+            LLAMA_LOG_WARN("%s: no imatrix data for layer %d attention output, using heuristic\n",
+                           __func__, il);
+            continue;
+        }
+
+        layers_found++;
+
+        // wo weight shape: [head_dim * n_heads, n_embd]
+        // imatrix has one importance value per input dimension = head_dim * n_heads
+        size_t expected_size = (size_t)(head_dim * n_head);
+
+        if (wo_importance->size() != expected_size) {
+            LLAMA_LOG_INFO("%s: layer %d wo imatrix size %zu (expected %zu)\n",
+                           __func__, il, wo_importance->size(), expected_size);
+        }
+
+        // Compute importance per head by summing importance of that head's dimensions
+        // Head h owns dimensions [h*head_dim, (h+1)*head_dim)
+        for (int h = 0; h < n_head; h++) {
+            float head_imp = 0.0f;
+
+            for (int d = 0; d < head_dim; d++) {
+                size_t idx = (size_t)(h * head_dim + d);
+                if (idx < wo_importance->size()) {
+                    head_imp += (*wo_importance)[idx];
+                }
+            }
+
+            state.importance[il][h] = head_imp;
+        }
+
+        // Normalize importance within layer
+        float sum = 0.0f;
+        float min_imp = state.importance[il][0];
+        float max_imp = state.importance[il][0];
+        for (int h = 0; h < n_head; h++) {
+            sum += state.importance[il][h];
+            min_imp = std::min(min_imp, state.importance[il][h]);
+            max_imp = std::max(max_imp, state.importance[il][h]);
+        }
+
+        if (sum > 0.0f) {
+            for (int h = 0; h < n_head; h++) {
+                state.importance[il][h] /= sum;
+                state.importance[il][h] *= n_head; // Scale to ~1.0 average
+            }
+        }
+
+        if (state.params.verbose) {
+            LLAMA_LOG_INFO("%s: layer %d importance from '%s': [", __func__, il, found_name.c_str());
+            for (int h = 0; h < std::min(n_head, 5); h++) {
+                LLAMA_LOG_INFO("%.3f%s", state.importance[il][h], h < n_head-1 ? ", " : "");
+            }
+            if (n_head > 5) LLAMA_LOG_INFO("...");
+            LLAMA_LOG_INFO("] (range: %.3f - %.3f)\n", min_imp, max_imp);
+        }
     }
+
+    LLAMA_LOG_INFO("%s: found imatrix data for %d/%d layers\n", __func__, layers_found, state.n_layer);
+    return layers_found > 0;
 }
 
-// Compute head importance using activation analysis
-// This requires running forward passes on calibration data
-static void compute_importance_from_activations(
-    llama_nash_state & state
-) {
-    LLAMA_LOG_INFO("%s: computing head importance from activations\n", __func__);
+// Compute head importance using heuristics when no imatrix available
+static void compute_importance_heuristic(llama_nash_state & state) {
+    LLAMA_LOG_INFO("%s: using heuristic importance (no calibration data)\n", __func__);
 
-    // For a full implementation:
-    // 1. Load calibration text
-    // 2. Tokenize
-    // 3. Run forward passes with hooks to capture attention outputs
-    // 4. Compute ||A_h||_F (Frobenius norm) for each head
-    // 5. Normalize importance scores
-
-    // For now, use a simpler heuristic based on layer position
-    // Early and late layers tend to be more important
+    // U-shaped importance: early and late layers tend to be more important
     for (int il = 0; il < state.n_layer; il++) {
-        // U-shaped importance: early and late layers more important
         float layer_factor = 1.0f;
         float mid = (float)(state.n_layer - 1) / 2.0f;
         float dist = std::abs((float)il - mid) / mid;
@@ -142,7 +213,7 @@ static void compute_importance_from_activations(
             state.importance[il][h] = layer_factor * head_factor;
         }
 
-        // Normalize
+        // Normalize within layer
         float sum = 0.0f;
         for (int h = 0; h < state.n_head[il]; h++) {
             sum += state.importance[il][h];
@@ -154,6 +225,25 @@ static void compute_importance_from_activations(
             }
         }
     }
+}
+
+// Compute head importance using activation analysis or imatrix
+static void compute_importance_from_activations(
+    llama_nash_state          & state,
+    const llama_imatrix_data  * imatrix
+) {
+    LLAMA_LOG_INFO("%s: computing head importance from activations\n", __func__);
+
+    // If imatrix is provided, use it for accurate importance
+    if (imatrix && !imatrix->empty()) {
+        if (compute_importance_from_imatrix(state, *imatrix)) {
+            return;  // Success
+        }
+        LLAMA_LOG_WARN("%s: failed to use imatrix, falling back to heuristic\n", __func__);
+    }
+
+    // Fallback to heuristic-based importance
+    compute_importance_heuristic(state);
 }
 
 //
@@ -382,7 +472,7 @@ static llama_nash_result apply_pruning(llama_nash_state & state) {
 llama_nash_result llama_nash_compute_pruning(
     const llama_model              & model,
     const llama_nash_prune_params  & params,
-    const std::vector<float>       * imatrix_data
+    const llama_imatrix_data       * imatrix
 ) {
     LLAMA_LOG_INFO("\n");
     LLAMA_LOG_INFO("%s: starting Nash equilibrium pruning\n", __func__);
@@ -391,12 +481,8 @@ llama_nash_result llama_nash_compute_pruning(
     // Create internal state
     llama_nash_state state(model, params);
 
-    // Step 1: Compute head importance
-    if (imatrix_data && !imatrix_data->empty()) {
-        compute_importance_from_imatrix(state, *imatrix_data);
-    } else {
-        compute_importance_from_activations(state);
-    }
+    // Step 1: Compute head importance from imatrix or heuristic
+    compute_importance_from_activations(state, imatrix);
 
     // Step 2: Compute redundancy matrix
     compute_redundancy_matrix(state);

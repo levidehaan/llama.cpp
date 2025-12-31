@@ -4,6 +4,7 @@
 
 #include <string>
 #include <vector>
+#include <unordered_map>
 
 //
 // Nash Equilibrium-Based Attention Head Pruning
@@ -15,6 +16,9 @@
 //
 // Reference: docs/nash-equilibrium-pruning.md
 //
+
+// Type alias for imatrix data (tensor_name -> importance vector)
+using llama_imatrix_data = std::unordered_map<std::string, std::vector<float>>;
 
 // Pruning parameters for Nash equilibrium computation
 struct llama_nash_prune_params {
@@ -92,12 +96,12 @@ struct ggml_tensor;
 //
 
 // Compute Nash equilibrium pruning decisions for a model
-// Uses calibration data or imatrix for importance estimation
+// Uses imatrix data for accurate importance estimation if provided
 // Returns pruning result with per-layer head masks
 llama_nash_result llama_nash_compute_pruning(
     const llama_model              & model,
     const llama_nash_prune_params  & params,
-    const std::vector<float>       * imatrix_data = nullptr  // Optional: use imatrix for importance
+    const llama_imatrix_data       * imatrix = nullptr  // Optional: tensor_name -> importance vector
 );
 
 // Check if a tensor name corresponds to an attention weight that should be pruned

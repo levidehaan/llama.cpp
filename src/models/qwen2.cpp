@@ -52,10 +52,11 @@ llm_build_qwen2::llm_build_qwen2(const llama_model & model, const llm_graph_para
             }
 
             // Use per-layer head counts to support Nash-pruned models
-            const int64_t n_head_il = hparams.n_head(il);
+            const int64_t n_head_il    = hparams.n_head(il);
+            const int64_t n_head_kv_il = hparams.n_head_kv(il);
             Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head_il, n_tokens);
-            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
-            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+            Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv_il, n_tokens);
+            Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv_il, n_tokens);
 
             Qcur = ggml_rope_ext(
                     ctx0, Qcur, inp_pos, nullptr,
